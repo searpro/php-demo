@@ -1,0 +1,36 @@
+name: bulwark
+on:
+  push:
+    branches: [main]
+env:
+  BULWARK_URL: ${{ vars.BULWARK_URL }}
+  BULWARK_TOKEN: ${{ secrets.BULWARK_TOKEN }}
+jobs:
+  release:
+    runs-on: ubuntu-latest   # must be able to reach BULWARK_URL
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install scanners
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v1.14.0
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz -C /usr/local/bin gitleaks || true
+          pip install -q semgrep
+          curl -sSf "$BULWARK_URL/api/scan.py" -o bulwark_scan.py
+      # environment: production
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL   # frees ~25 GB for large images
+      - name: Build image
+        run: docker build -t app:${{ github.sha }} .
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: make test   # replace with your test command
+      - name: Scan and report
+        run: |
+          syft app:${{ github.sha }} -o cyclonedx-json > sbom.json
+          DIGEST=$(docker inspect -f '{{.Id}}' app:${{ github.sha }})
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          python3 bulwark_scan.py . --commit ${{ github.sha }} --ref ${{ github.ref_name }} --digest "$DIGEST" --sbom sbom.json --tests ${{ steps.tests.outcome }} --run-url ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # your existing push and deploy steps go here, then:
+      - name: Record deployment
+        run: python3 bulwark_scan.py --deploy production --digest "$DIGEST" --skip-scan
